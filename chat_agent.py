@@ -2,7 +2,7 @@
 OpenRouter Desktop Chat Agent — single-file PySide6 application.
 
 Install:
-    py -m pip install PySide6 requests markdown
+    py -m pip install -r requirements.txt
 
 Run:
     py chat_agent.py
@@ -19,14 +19,23 @@ Features:
 import sys
 import os
 import json
+import base64
+import io
+import mimetypes
 import sqlite3
 import html
 import re
 import uuid
+from zipfile import BadZipFile
 from datetime import datetime
 
 import requests
 import markdown
+from docx import Document
+from docx.opc.exceptions import PackageNotFoundError
+from lxml.etree import XMLSyntaxError
+from pypdf import PdfReader
+from pypdf.errors import FileNotDecryptedError, PdfReadError
 
 from PySide6.QtCore import Qt, QThread, Signal, QSettings, QSize
 from PySide6.QtGui import QAction, QFont, QKeySequence, QTextCursor
@@ -106,9 +115,13 @@ class Store:
         CREATE TABLE IF NOT EXISTS messages(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL,
             role TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL,
+            attachments TEXT NOT NULL DEFAULT '[]',
             FOREIGN KEY(chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
         """)
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(messages)")}
+        if "attachments" not in columns:
+            self.db.execute("ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'")
         self.db.commit()
 
     def chats(self):
@@ -137,20 +150,25 @@ class Store:
 
     def messages(self, cid):
         return self.db.execute(
-            "SELECT role,content,created_at FROM messages WHERE chat_id=? ORDER BY id", (cid,)
+            "SELECT role,content,created_at,attachments FROM messages WHERE chat_id=? ORDER BY id",
+            (cid,)
         ).fetchall()
 
-    def add_message(self, cid, role, content):
+    def add_message(self, cid, role, content, attachments=None):
         now = datetime.now().isoformat(timespec="seconds")
-        self.db.execute("INSERT INTO messages(chat_id,role,content,created_at) VALUES(?,?,?,?)",
-                        (cid, role, content, now))
+        attachments = attachments or []
+        self.db.execute(
+            "INSERT INTO messages(chat_id,role,content,created_at,attachments) VALUES(?,?,?,?,?)",
+            (cid, role, content, now, json.dumps(attachments))
+        )
         self.db.execute("UPDATE chats SET updated_at=? WHERE id=?",
                         (now, cid))
         # Use the first user message as the conversation title.
         if role == "user":
             row = self.db.execute("SELECT title FROM chats WHERE id=?", (cid,)).fetchone()
             if row and row["title"] == "New chat":
-                title = re.sub(r"\s+", " ", content).strip()[:42]
+                title_source = content or ", ".join(item["name"] for item in attachments)
+                title = re.sub(r"\s+", " ", title_source).strip()[:42]
                 self.db.execute("UPDATE chats SET title=? WHERE id=?", (title or "New chat", cid))
         self.db.commit()
 
@@ -338,9 +356,10 @@ class SettingsDialog(QDialog):
         self.settings.setValue("max_tokens", self.tokens.value())
 
 class MessageCard(QFrame):
-    def __init__(self, role, content="", parent=None):
+    def __init__(self, role, content="", attachments=None, parent=None):
         super().__init__(parent)
         self.role = role
+        self.attachments = attachments or []
         self.setObjectName("MessageCard")
         self.setStyleSheet(
             "QFrame#MessageCard { background:%s; border:1px solid %s; border-radius:12px; }" %
@@ -362,7 +381,18 @@ class MessageCard(QFrame):
         self.copy_btn.setToolTip("Copy message")
         self.copy_btn.clicked.connect(self.copy_text)
         header.addWidget(self.copy_btn)
+        if role == "assistant":
+            self.save_btn = QToolButton()
+            self.save_btn.setText("Save")
+            self.save_btn.setToolTip("Save the complete response as a Markdown file")
+            self.save_btn.clicked.connect(self.save_response)
+            header.addWidget(self.save_btn)
         outer.addLayout(header)
+        self.attachment_layout = QVBoxLayout()
+        self.attachment_layout.setContentsMargins(0, 0, 0, 0)
+        self.attachment_layout.setSpacing(4)
+        outer.addLayout(self.attachment_layout)
+        self._show_attachments()
         self.content_layout = QVBoxLayout()
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(10)
@@ -370,6 +400,50 @@ class MessageCard(QFrame):
         self.code_areas = []
         self.content = content
         self.set_content(content)
+
+    def _show_attachments(self):
+        for attachment in self.attachments:
+            row = QHBoxLayout()
+            name = QLabel(attachment.get("name", "Attached file"))
+            name.setStyleSheet("color:#9cdcfe;background:transparent;")
+            row.addWidget(name)
+            row.addStretch()
+            save_btn = QToolButton()
+            save_btn.setText("Download")
+            save_btn.setToolTip(f"Save {name.text()} to your computer")
+            save_btn.clicked.connect(
+                lambda checked=False, item=attachment: self.save_attachment(item)
+            )
+            row.addWidget(save_btn)
+            self.attachment_layout.addLayout(row)
+
+    def save_attachment(self, attachment):
+        name = os.path.basename(attachment.get("name", "attachment")) or "attachment"
+        path, _ = QFileDialog.getSaveFileName(self, "Download attachment", name, "All files (*)")
+        if not path:
+            return
+        try:
+            if attachment.get("kind") in ("image", "document"):
+                content = base64.b64decode(attachment["data"], validate=True)
+                with open(path, "wb") as target:
+                    target.write(content)
+            else:
+                with open(path, "w", encoding="utf-8", newline="") as target:
+                    target.write(attachment["data"])
+        except (OSError, KeyError, ValueError) as exc:
+            QMessageBox.warning(self, "Download failed", f"Could not save the attachment:\n{exc}")
+
+    def save_response(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save response", "response.md", "Markdown files (*.md);;Text files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as target:
+                target.write(self.content)
+        except OSError as exc:
+            QMessageBox.warning(self, "Save failed", f"Could not save the response:\n{exc}")
 
     def _add_text_area(self, content):
         browser = QTextBrowser()
@@ -424,6 +498,13 @@ class MessageCard(QFrame):
             lambda checked=False, source=code.rstrip("\n"): QApplication.clipboard().setText(source)
         )
         toolbar.addWidget(copy_code_btn)
+        save_code_btn = QToolButton()
+        save_code_btn.setText("Save code")
+        save_code_btn.setToolTip("Save this code block as a file")
+        save_code_btn.clicked.connect(
+            lambda checked=False, source=code.rstrip("\n"), lang=language: self.save_code(source, lang)
+        )
+        toolbar.addWidget(save_code_btn)
         code_layout.addLayout(toolbar)
         code_area = QPlainTextEdit()
         code_area.setReadOnly(True)
@@ -439,6 +520,27 @@ class MessageCard(QFrame):
         code_layout.addWidget(code_area)
         self.content_layout.addWidget(code_frame)
         self.code_areas.append(code_area)
+
+    def save_code(self, code, language):
+        extensions = {
+            "bash": "sh", "c++": "cpp", "c#": "cs", "cpp": "cpp",
+            "javascript": "js", "typescript": "ts", "markdown": "md",
+            "powershell": "ps1", "python": "py", "shell": "sh", "text": "txt",
+        }
+        extension = extensions.get(language.strip().lower())
+        if not extension:
+            candidate = re.sub(r"[^a-zA-Z0-9]", "", language.strip().lower())
+            extension = candidate[:10] or "txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save code block", f"code.{extension}", "All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as target:
+                target.write(code)
+        except OSError as exc:
+            QMessageBox.warning(self, "Save failed", f"Could not save the code block:\n{exc}")
 
     def set_content(self, content):
         self.content = content
@@ -485,6 +587,7 @@ class MainWindow(QMainWindow):
         self.current_assistant_card = None
         self.stream_buffer = ""
         self._building_history = False
+        self.pending_attachments = []
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -582,6 +685,10 @@ class MainWindow(QMainWindow):
         self.input.setAcceptRichText(False)
         input_row.addWidget(self.input, 1)
         buttons_col = QVBoxLayout()
+        self.attach_btn = QPushButton("Attach file")
+        self.attach_btn.setToolTip("Attach text files or images (up to 5 files, 5 MB each)")
+        self.attach_btn.clicked.connect(self.attach_files)
+        buttons_col.addWidget(self.attach_btn)
         self.send_btn = QPushButton("Send  ➤")
         self.send_btn.setObjectName("Primary")
         self.send_btn.setMinimumWidth(100)
@@ -598,6 +705,12 @@ class MainWindow(QMainWindow):
         buttons_col.addStretch()
         input_row.addLayout(buttons_col)
         composer_layout.addLayout(input_row)
+        self.pending_attachments_widget = QWidget()
+        self.pending_attachments_layout = QVBoxLayout(self.pending_attachments_widget)
+        self.pending_attachments_layout.setContentsMargins(0, 0, 0, 0)
+        self.pending_attachments_layout.setSpacing(2)
+        self.pending_attachments_widget.hide()
+        composer_layout.addWidget(self.pending_attachments_widget)
         foot = QHBoxLayout()
         foot.addWidget(QLabel("ENTER to send  ·  SHIFT+ENTER for a new line  ·  AI can make mistakes"))
         foot.addStretch()
@@ -775,7 +888,10 @@ class MainWindow(QMainWindow):
         messages = self.store.messages(cid)
         self.welcome_panel.setVisible(not messages)
         for message in messages:
-            self.add_card(message["role"], message["content"])
+            self.add_card(
+                message["role"], message["content"],
+                json.loads(message["attachments"] or "[]")
+            )
         self.regen_btn.setEnabled(bool(messages))
         self.scroll_to_bottom()
 
@@ -792,12 +908,133 @@ class MainWindow(QMainWindow):
         self.messages_layout.addWidget(self.welcome_panel)
         self.messages_layout.addStretch(1)
 
-    def add_card(self, role, content=""):
+    def add_card(self, role, content="", attachments=None):
         self.welcome_panel.hide()
-        card = MessageCard(role, content)
+        card = MessageCard(role, content, attachments)
         self.messages_layout.insertWidget(self.messages_layout.count() - 1, card)
         self.scroll_to_bottom()
         return card
+
+    def attach_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Attach files", "",
+            "Supported files (*.txt *.md *.csv *.json *.xml *.yaml *.yml *.log "
+            "*.py *.js *.ts *.html *.css *.sql *.sh *.ps1 *.pdf *.docx "
+            "*.png *.jpg *.jpeg *.gif *.webp);;"
+            "All files (*)"
+        )
+        if not paths:
+            return
+
+        errors = []
+        text_extensions = {
+            ".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log",
+            ".py", ".js", ".ts", ".html", ".css", ".sql", ".sh", ".ps1",
+        }
+        document_extensions = {".pdf", ".docx"}
+        image_types = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+        total_size = sum(len(item["data"].encode("utf-8")) if item["kind"] == "text"
+                         else len(base64.b64decode(item["data"]))
+                         for item in self.pending_attachments)
+
+        for path in paths:
+            if len(self.pending_attachments) >= 5:
+                errors.append("You can attach up to 5 files per message.")
+                break
+            try:
+                size = os.path.getsize(path)
+                if size > 5 * 1024 * 1024:
+                    raise ValueError("files must be 5 MB or smaller")
+                if total_size + size > 10 * 1024 * 1024:
+                    raise ValueError("the combined attachment size must be 10 MB or smaller")
+                name = os.path.basename(path)
+                mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+                extension = os.path.splitext(name)[1].lower()
+                if extension in text_extensions or mime_type.startswith("text/") or mime_type in {
+                    "application/json", "application/xml"
+                }:
+                    with open(path, "r", encoding="utf-8-sig") as source:
+                        data = source.read()
+                    attachment = {"name": name, "mime_type": mime_type, "kind": "text", "data": data}
+                elif extension in document_extensions:
+                    with open(path, "rb") as source:
+                        raw_data = source.read()
+                    if extension == ".pdf":
+                        try:
+                            reader = PdfReader(io.BytesIO(raw_data))
+                            if reader.is_encrypted:
+                                raise ValueError("encrypted PDFs are not supported")
+                            extracted_text = "\n".join(
+                                page.extract_text() or "" for page in reader.pages
+                            ).strip()
+                        except (FileNotDecryptedError, PdfReadError) as exc:
+                            raise ValueError(f"could not read PDF: {exc}") from exc
+                    else:
+                        try:
+                            document = Document(io.BytesIO(raw_data))
+                            extracted_text = "\n".join(
+                                paragraph.text for paragraph in document.paragraphs
+                                if paragraph.text.strip()
+                            )
+                            for table in document.tables:
+                                for row in table.rows:
+                                    extracted_text += "\n" + "\t".join(
+                                        cell.text for cell in row.cells
+                                    )
+                            extracted_text = extracted_text.strip()
+                        except (BadZipFile, KeyError, PackageNotFoundError, XMLSyntaxError) as exc:
+                            raise ValueError(f"could not read DOCX: {exc}") from exc
+                    if not extracted_text:
+                        raise ValueError("no extractable text was found")
+                    attachment = {
+                        "name": name,
+                        "mime_type": mime_type,
+                        "kind": "document",
+                        "data": base64.b64encode(raw_data).decode("ascii"),
+                        "text": extracted_text,
+                    }
+                elif mime_type in image_types:
+                    with open(path, "rb") as source:
+                        data = base64.b64encode(source.read()).decode("ascii")
+                    attachment = {"name": name, "mime_type": mime_type, "kind": "image", "data": data}
+                else:
+                    raise ValueError("only text files and PNG, JPEG, GIF, or WebP images are supported")
+                self.pending_attachments.append(attachment)
+                total_size += size
+            except (OSError, UnicodeError, ValueError) as exc:
+                errors.append(f"{os.path.basename(path)}: {exc}")
+
+        self._refresh_pending_attachments()
+        if errors:
+            QMessageBox.warning(self, "Some files were not attached", "\n".join(errors))
+
+    def _refresh_pending_attachments(self):
+        while self.pending_attachments_layout.count():
+            item = self.pending_attachments_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        for index, attachment in enumerate(self.pending_attachments):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            label = QLabel(attachment["name"])
+            label.setStyleSheet("color:#9cdcfe;background:transparent;")
+            row.addWidget(label)
+            row.addStretch()
+            remove_btn = QToolButton()
+            remove_btn.setText("Remove")
+            remove_btn.clicked.connect(
+                lambda checked=False, item_index=index: self._remove_pending_attachment(item_index)
+            )
+            row.addWidget(remove_btn)
+            self.pending_attachments_layout.addWidget(row_widget)
+        self.pending_attachments_widget.setVisible(bool(self.pending_attachments))
+
+    def _remove_pending_attachment(self, index):
+        if 0 <= index < len(self.pending_attachments):
+            self.pending_attachments.pop(index)
+            self._refresh_pending_attachments()
 
     def scroll_to_bottom(self):
         from PySide6.QtCore import QTimer
@@ -843,6 +1080,11 @@ class MainWindow(QMainWindow):
         for message in self.store.messages(self.current_chat):
             role = "You" if message["role"] == "user" else "Assistant"
             lines.extend([f"## {role}", "", message["content"], ""])
+            attachments = json.loads(message["attachments"] or "[]")
+            for attachment in attachments:
+                lines.append(f"- Attachment: {attachment['name']}")
+            if attachments:
+                lines.append("")
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as export_file:
                 export_file.write("\n".join(lines))
@@ -870,15 +1112,44 @@ class MainWindow(QMainWindow):
         system = self.settings.value("system_prompt", DEFAULT_SYSTEM)
         messages = [{"role": "system", "content": system}]
         for row in self.store.messages(cid):
-            if row["role"] in ("user", "assistant") and row["content"].strip():
-                messages.append({"role": row["role"], "content": row["content"]})
+            attachments = json.loads(row["attachments"] or "[]")
+            if row["role"] not in ("user", "assistant"):
+                continue
+            if not row["content"].strip() and not attachments:
+                continue
+            text = row["content"]
+            images = []
+            for attachment in attachments:
+                if attachment["kind"] == "text":
+                    text += (
+                        f"\n\n--- Attached file: {attachment['name']} ---\n"
+                        f"{attachment['data']}\n--- End of {attachment['name']} ---"
+                    )
+                elif attachment["kind"] == "document":
+                    text += (
+                        f"\n\n--- Attached file: {attachment['name']} ---\n"
+                        f"{attachment['text']}\n--- End of {attachment['name']} ---"
+                    )
+                elif attachment["kind"] == "image":
+                    images.append(attachment)
+            if images:
+                parts = [{"type": "text", "text": text or "Please inspect the attached image(s)."}]
+                parts.extend({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image['mime_type']};base64,{image['data']}"
+                    }
+                } for image in images)
+                messages.append({"role": row["role"], "content": parts})
+            else:
+                messages.append({"role": row["role"], "content": text})
         return messages
 
     def send_message(self):
         if self.worker and self.worker.isRunning():
             return
         text = self.input.toPlainText().strip()
-        if not text:
+        if not text and not self.pending_attachments:
             return
         key = str(self.settings.value("api_key", "") or "").strip().strip('"').strip("'")
         if key.lower().startswith("bearer "):
@@ -890,9 +1161,12 @@ class MainWindow(QMainWindow):
             return
         if not self.current_chat:
             self.new_chat()
+        attachments = self.pending_attachments[:]
         self.input.clear()
-        self.store.add_message(self.current_chat, "user", text)
-        self.add_card("user", text)
+        self.pending_attachments.clear()
+        self._refresh_pending_attachments()
+        self.store.add_message(self.current_chat, "user", text, attachments)
+        self.add_card("user", text, attachments)
         self.refresh_chat_list(self.current_chat)
         self.chat_title.setText(self.store.get_chat(self.current_chat)["title"])
         self._start_generation()

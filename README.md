@@ -16,6 +16,7 @@ A Windows desktop chat client for OpenRouter, built with Python and PySide6. Cho
   - `xingchen-agi/xing4.0-29b-a4b:free`
 - Save conversation history locally in SQLite. Rename and delete conversations from the history list.
 - Render Markdown and display fenced code blocks in dedicated read-only code areas with copy buttons.
+- Attach text files, PDFs, DOCX documents, and images to messages; download saved attachments; and save assistant replies or code blocks to files.
 - Export a conversation as a Markdown file, clear its messages, stop a response, or regenerate the last response.
 - Configure the API key, default model, system prompt, temperature, and response token limit in Settings.
 - Use the welcome screen prompt shortcuts to get started quickly.
@@ -41,6 +42,8 @@ python chat_agent.py
 ```
 
 Open **Settings** in the app, enter your OpenRouter API key, and save it. Choose a model from the selector and start a conversation.
+
+Use **Attach file** in the composer to include up to five text files, PDF/DOCX documents, or images (5 MB each, 10 MB total) with a message. Text is extracted from PDFs and DOCX files and sent to the selected model; scanned PDFs without a text layer are not supported. Images are sent directly, and image support depends on the selected model. Original attachments are stored in local conversation history. Use **Download** on a message attachment or **Save** / **Save code** on an assistant reply to save files locally.
 
 ## Keyboard shortcuts
 
